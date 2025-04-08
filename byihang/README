@@ -1,0 +1,9 @@
+Command for Compilation
+
+My code works with the Makefile given by the starter code. Remove the O4 optimization from the Makefile. 
+
+Have Murphi build. No changes made to Murphi.
+
+./mu msi[_opt].m
+make msi[_opt]
+./msi[_opt]
