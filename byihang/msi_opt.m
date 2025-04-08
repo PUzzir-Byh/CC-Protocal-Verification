@@ -11,8 +11,9 @@ const
   -- TODO: What is VC?
   VC0: 0;                -- low priority
   VC1: 1;
+  VC2: 2;
   QMax: 2;
-  NumVCs: VC1 - VC0 + 1;
+  NumVCs: VC2 - VC0 + 1;
   NetMax: ProcCount+1;
 
 ----------------------------------------------------------------------
@@ -39,7 +40,8 @@ type
                        RecallReq, 				-- Request & invalidate a valid copy
                        InvReq,             -- Request & invalidate a shared copy
                        DowngradeReq,			-- Request & downgrade a modified copy to shared state
-                       DowngradeAck			-- Acknowledge a downgrade request
+                       DowngradeAck,			-- Acknowledge a downgrade request
+                       AutoDowngradeReq			-- Request HomeNode, Send by Modified processor
                     };
 
   Message:
@@ -63,7 +65,7 @@ type
   ProcState:
     Record
       state: enum { P_Modified, P_Invalid, P_Shared,
-                  PT_I2SPending, PT_I2MPending, PT_S2MPending, PT_WritebackPending
+                  PT_I2SPending, PT_I2MPending, PT_S2MPending, PT_WritebackPending, PT_M2SPending
                   };
       val: Value;
     End;
@@ -138,7 +140,7 @@ Begin
       then 
         -- Send invalidation message here
         -- TODO: Check if VC is correct
-        Send(InvReq, n, HomeType, VC0, UNDEFINED); 
+        Send(InvReq, n, HomeType, VC2, UNDEFINED); 
         -- RemoveFromSharersList(n);
       endif;
     endif;
@@ -164,8 +166,8 @@ Procedure HomeReceive(msg:Message);
 var cnt:0..ProcCount;  -- for counting sharers
 Begin
 -- Debug output may be helpful:
-  -- put "Receiving "; put msg.mtype; put " from "; put msg.src; put " on VC"; put msg.vc; 
-  -- put " at home -- "; put HomeNode.state;
+  put "Receiving "; put msg.mtype; put " from "; put msg.src; put " on VC"; put msg.vc; 
+  put " at home -- "; put HomeNode.state;
 
   -- The line below is not needed in Valid/Invalid protocol.  However, the 
   -- compiler barfs if we put this inside a switch, so it is useful to
@@ -226,6 +228,14 @@ Begin
       Send(WBAck, msg.src, HomeType, VC1, UNDEFINED);
       undefine HomeNode.owner
 
+    case AutoDowngradeReq:
+      Assert (msg.src = HomeNode.owner) "Modified state: AutoDowngradeReq from non-owner";
+      HomeNode.state := H_Shared;
+      HomeNode.val := msg.val;
+      AddToSharersList(msg.src);
+      Send(ReadAck, msg.src, HomeType, VC1, HomeNode.val);
+      undefine HomeNode.owner;
+
     else
       ErrorUnhandledMsg(msg, HomeType);
 
@@ -246,7 +256,6 @@ Begin
       -- Assert ((cnt > 1) | (cnt = 1 & IsSharer(msg.src))) "Error ReadExReq";
       HomeNode.state := HT_S2MPending;
       SendInvReqToSharers(msg.src);
-      -- Send(ReadExAck, msg.src, HomeType, VC1, HomeNode.val);
       if (IsSharer(msg.src))
       then
          if cnt = 1
@@ -267,7 +276,13 @@ Begin
       then
         HomeNode.state := H_Invalid;
       endif;
-
+    -- TODONOW: Not gonna happen
+    case AutoDowngradeReq:
+      put "cnt = "; put cnt;
+      put "Proc = "; put msg.src;
+      put Procs[msg.src].state;
+      Assert (IsSharer(msg.src) = true) "AutoDowngradeReq from non-sharer";
+      Assert (false) "AutoDowngradeReq in shared state";
     else
       ErrorUnhandledMsg(msg, HomeType);
     endswitch;
@@ -281,6 +296,21 @@ Begin
       HomeNode.val := msg.val;
       Send(ReadAck, msg.src, HomeType, VC1, HomeNode.val);
       SendAckToSharers(ReadAck, HomeNode.val, msg.src);
+    case AutoDowngradeReq:
+      Assert (cnt = 0 | IsSharer(msg.src) = true) "DowngradeAck from non-sharer";
+      if (IsSharer(msg.src))
+      then
+        Assert (cnt = 2) "More than 2 sharers";
+        HomeNode.state := H_Shared;
+        HomeNode.val := msg.val;
+        SendAckToSharers(ReadAck, HomeNode.val, msg.src);
+      else
+        Assert (cnt = 0) "More than 0 sharers";
+        Assert (!IsUnDefined(HomeNode.owner)) "owner undefined";
+        HomeNode.state := H_Modified;
+        HomeNode.val := msg.val;
+        Send(ReadExAck, HomeNode.owner, HomeType, VC1, HomeNode.val);
+      endif;
     case WBReq:
       -- TODO: How to make sure all sharer are invalidated?
       if cnt = 0
@@ -298,10 +328,15 @@ Begin
         Assert (cnt = 2) "Sharers count is not 2";
         Assert (IsSharer(msg.src) = true) "Writeback from non-sharer";
         -- Assert (!IsUnDefined(msg.val)) "Writeback value is undefined";
-        HomeNode.state := H_Shared;
-        HomeNode.val := msg.val;
-        SendAckToSharers(ReadAck, msg.val, msg.src);
-        RemoveFromSharersList(msg.src);
+        if (IsUnDefined(msg.val))
+        then
+          msg_processed := false; -- stall message in InBox
+        else
+          HomeNode.state := H_Shared;
+          HomeNode.val := msg.val;
+          SendAckToSharers(ReadAck, msg.val, msg.src);
+          RemoveFromSharersList(msg.src);
+        endif;
       endif;
 
     case ReadReq:
@@ -320,7 +355,6 @@ Begin
       Assert (HomeNode.owner != msg.src) "Writeback from owner";
       Assert (IsSharer(msg.src) = true) "Writeback from non-sharer";
       RemoveFromSharersList(msg.src);
-      
       if (cnt = 1)
       then
         HomeNode.state := H_Modified;
@@ -330,6 +364,11 @@ Begin
       msg_processed := false; -- stall message in InBox
     case ReadExReq:
       msg_processed := false; -- stall message in InBox
+    case AutoDowngradeReq:
+      -- TODONOW: Not gonna happen
+      put "cnt = "; put cnt;
+      Assert (IsSharer(msg.src) = true) "DowngradeReq from non-sharer";
+      Assert (false) "AutoDowngradeReq in HT_S2MPending state";
     else
       ErrorUnhandledMsg(msg, HomeType);
     endswitch;
@@ -338,8 +377,8 @@ End;
 
 Procedure ProcReceive(msg:Message; p:Proc);
 Begin
-  -- put "Receiving "; put msg.mtype; put " on VC"; put msg.vc; 
-  -- put " at proc "; put p; put " -- "; put Procs[p].state;
+  put "Receiving "; put msg.mtype; put " on VC"; put msg.vc; 
+  put " at proc "; put p; put " -- "; put Procs[p].state;
 
   -- default to 'processing' message.  set to false otherwise
   msg_processed := true;
@@ -383,7 +422,6 @@ Begin
       pv := msg.val;
       ps := P_Shared;
     case InvReq:
-      -- TODONOW: How is this possible?
     	msg_processed := false; -- stall message in InBox
     else
       ErrorUnhandledMsg(msg, p);
@@ -403,6 +441,28 @@ Begin
     case DowngradeReq:
       msg_processed := false; -- stall message in InBox
     else
+      ErrorUnhandledMsg(msg, p);
+    endswitch;
+
+  case PT_M2SPending:
+  -- The proc is auto downgrading
+  Assert (!isundefined(pv)) "Error: Unexpected undefined value";
+    switch msg.mtype
+    case ReadAck:
+      ps := P_Shared;
+    case RecallReq:
+      -- Only case: The proc is auto downgrading itself, while home is recalling it because Rdx.
+      -- Maybe another case: The proc is downgrading itself, the home rdack it, but the home is recalling it and arrives first. A readack on the way.
+      -- case 2 impossible, the proc will receive the invreq instead of the recallreq.
+      undefine pv;
+      ps := P_Invalid;
+    case DowngradeReq:
+      -- TODO: Maybe a better way to handle this?
+      -- Only case: The proc is auto downgrading itself, while home is also downgrading it.
+      ps := P_Shared;
+    case InvReq:
+    	msg_processed := false; -- stall message in InBox
+    else 
       ErrorUnhandledMsg(msg, p);
     endswitch;
 
@@ -429,6 +489,7 @@ Begin
     else
       ErrorUnhandledMsg(msg, p);
     endswitch;
+
 
   case PT_WritebackPending:    
 
@@ -505,7 +566,7 @@ ruleset n:Proc Do
 
   rule "writeback from modified"
   -- TOASK: Is shared ever going to do wb? YES?
-     (p.state = P_Modified)
+     p.state = P_Modified
   ==>
     Send(WBReq, HomeType, n, VC1, p.val); 
     p.state := PT_WritebackPending;
@@ -516,9 +577,17 @@ ruleset n:Proc Do
     (p.state = P_Shared)
   ==>
     -- TODONOW: Change back from real value
-    Send(WBReq, HomeType, n, VC1, p.val); 
+    Send(WBReq, HomeType, n, VC1, UNDEFINED); 
     p.state := PT_WritebackPending;
     undefine p.val;
+  endrule;
+
+  rule "self-downgrade"
+    (p.state = P_Modified)
+  ==>
+    -- TOCHECK: Using VC1
+    Send(AutoDowngradeReq, HomeType, n, VC2, p.val);
+    p.state := PT_M2SPending;
   endrule;
 
   endalias;
